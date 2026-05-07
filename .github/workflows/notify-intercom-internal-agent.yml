@@ -1,0 +1,148 @@
+name: Notify Intercom internal-agent on PR
+
+# Sends each PR's title, description, and metadata to Intercom's
+# internal-agent external-trigger endpoint, asking it to scan help-center
+# articles and procedures for content that may need updating.
+#
+# Required repo secrets:
+#   INTERCOM_TOKEN     — Intercom access token with `manage_internal_agent_chats`
+#                        scope (see Settings → Secrets → Actions).
+#
+# Optional repo secrets / variables:
+#   INTERCOM_API_BASE  — Base URL for the Intercom API. Defaults to
+#                        `https://api.intercom.io`. Override for staging.
+#   INTERCOM_VERSION   — Intercom-Version header. Defaults to `2.13`.
+#   INTERCOM_APP_ID    — Intercom workspace id_code (e.g. `tx2p130c`). When
+#                        set, the workflow logs a clickable link to the chat
+#                        for click-through from the GitHub run page.
+#   INTERCOM_APP_HOST  — Base URL of the Intercom admin app. Defaults to
+#                        `https://app.intercom.com`. Override for staging.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build trigger payload
+        id: payload
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_STATE: ${{ github.event.pull_request.state }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          REPO: ${{ github.repository }}
+          ACTION: ${{ github.event.action }}
+        run: |
+          # Use jq to safely JSON-encode all string fields (handles quotes,
+          # newlines, control chars, etc. without manual escaping).
+          jq -n \
+            --arg agent_mode "content-configuration-agent" \
+            --arg prompt "There was an update to the code. Search THIS WORKSPACE's own content — the help-center articles, collections, and procedures authored by this workspace's team — for anything that may be affected, and propose concrete edits to that content straight away. IMPORTANT: do NOT search, reference, or propose edits against Intercom's own product documentation or any generic Intercom content; the goal is to keep the workspace's customer-facing and internal content in sync with the code change, not to learn or explain how Intercom itself works. Do NOT ask for confirmation, do NOT ask clarifying questions, and do NOT wait for approval before drafting changes — go ahead and produce the proposed updates in this same response. This trigger comes from a GitHub Action and there is no human in the loop to answer follow-up questions, so any hesitation or request for confirmation is a failure mode. Just identify the relevant workspace-owned content and propose the updates directly." \
+            --arg pr_title "$PR_TITLE" \
+            --arg pr_body "$PR_BODY" \
+            --arg pr_url "$PR_URL" \
+            --arg pr_number "$PR_NUMBER" \
+            --arg pr_author "$PR_AUTHOR" \
+            --arg pr_base "$PR_BASE" \
+            --arg pr_head "$PR_HEAD" \
+            --arg pr_state "$PR_STATE" \
+            --arg pr_merged "$PR_MERGED" \
+            --arg repo "$REPO" \
+            --arg action "$ACTION" \
+            '{
+              agent_mode: $agent_mode,
+              summary: ($prompt + "\n\n## Pull request: " + $pr_title + "\n\n" + $pr_body),
+              source_references: [
+                {
+                  type: "github_pull_request",
+                  url: $pr_url,
+                  title: $pr_title,
+                  author: $pr_author
+                }
+              ],
+              metadata: {
+                trigger_source: "github_action",
+                github_event: ("pull_request." + $action),
+                github_repository: $repo,
+                github_pr_number: ($pr_number | tonumber),
+                github_pr_actor: $pr_author,
+                github_base_branch: $pr_base,
+                github_head_branch: $pr_head,
+                github_pr_state: $pr_state,
+                github_pr_merged: ($pr_merged == "true")
+              }
+            }' > payload.json
+          echo "payload size: $(wc -c < payload.json) bytes"
+
+      - name: POST to Intercom internal-agent
+        id: dispatch
+        env:
+          INTERCOM_TOKEN: ${{ secrets.INTERCOM_TOKEN }}
+          INTERCOM_API_BASE: ${{ secrets.INTERCOM_API_BASE || vars.INTERCOM_API_BASE || 'https://api.intercom.io' }}
+          INTERCOM_VERSION: ${{ secrets.INTERCOM_VERSION || vars.INTERCOM_VERSION || '2.13' }}
+          INTERCOM_APP_ID: ${{ secrets.INTERCOM_APP_ID || vars.INTERCOM_APP_ID }}
+          INTERCOM_APP_HOST: ${{ secrets.INTERCOM_APP_HOST || vars.INTERCOM_APP_HOST || 'https://app.intercom.com' }}
+        run: |
+          if [ -z "$INTERCOM_TOKEN" ]; then
+            echo "::error::INTERCOM_TOKEN secret is not configured on this repo"
+            exit 1
+          fi
+
+          response_file=$(mktemp)
+          status=$(curl -sS -o "$response_file" -w "%{http_code}" \
+            -X POST "${INTERCOM_API_BASE}/internal_agent/chats" \
+            -H "Authorization: Bearer ${INTERCOM_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Intercom-Version: ${INTERCOM_VERSION}" \
+            --data @payload.json)
+
+          echo "HTTP $status"
+          cat "$response_file"
+          echo
+
+          # Treat 2xx as success
+          case "$status" in
+            2*) ;;
+            *)  echo "::error::Intercom returned HTTP $status"; exit 1 ;;
+          esac
+
+          chat_id=$(jq -r '.chat_id // empty' < "$response_file")
+
+          # Build the click-through URL when we know the workspace id.
+          # Without INTERCOM_APP_ID we can't construct it (the API doesn't
+          # return one), so fall back to just surfacing the chat_id.
+          if [ -n "$chat_id" ] && [ -n "$INTERCOM_APP_ID" ]; then
+            chat_url="${INTERCOM_APP_HOST%/}/a/apps/${INTERCOM_APP_ID}/internal-agent/chats/${chat_id}"
+            echo "::notice::Intercom chat dispatched: ${chat_url}"
+            {
+              echo "### Intercom internal-agent chat dispatched"
+              echo
+              echo "[View chat in Intercom](${chat_url})"
+              echo
+              echo "- chat_id: \`${chat_id}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "chat_url=${chat_url}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Intercom chat dispatched (${chat_id})"
+            {
+              echo "### Intercom internal-agent chat dispatched"
+              echo
+              echo "- chat_id: \`${chat_id}\`"
+              if [ -z "$INTERCOM_APP_ID" ]; then
+                echo "- _Set the \`INTERCOM_APP_ID\` repo variable to get a clickable chat link here._"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "chat_id=${chat_id}" >> "$GITHUB_OUTPUT"
