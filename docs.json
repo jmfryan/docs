@@ -48,6 +48,12 @@
               "ai-tools/claude-code",
               "ai-tools/windsurf"
             ]
+          },
+          {
+            "group": "Trust & security",
+            "pages": [
+              "security"
+            ]
           }
         ]
       },
