@@ -1,8 +1,10 @@
-name: Notify Intercom internal-agent on PR
+name: Notify Intercom internal-agent on push to main
 
-# Sends each PR's title, description, and metadata to Intercom's
-# internal-agent external-trigger endpoint, asking it to scan help-center
-# articles and procedures for content that may need updating.
+# Runs on every push to `main` (typically a PR landing) and POSTs the
+# head commit's metadata, full message, and diff to Intercom's
+# internal-agent external-trigger endpoint, asking it to scan
+# help-center articles and procedures for content that may need
+# updating.
 #
 # Required repo secrets:
 #   INTERCOM_TOKEN     — Intercom access token with `manage_internal_agent_chats`
@@ -19,31 +21,31 @@ name: Notify Intercom internal-agent on PR
 #                        `https://app.intercom.com`. Override for staging.
 
 on:
-  pull_request:
-    types: [opened, edited, reopened, synchronize]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
+      - name: Check out repo with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Build trigger payload
         id: payload
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          PR_BASE: ${{ github.event.pull_request.base.ref }}
-          PR_HEAD: ${{ github.event.pull_request.head.ref }}
-          PR_STATE: ${{ github.event.pull_request.state }}
-          PR_MERGED: ${{ github.event.pull_request.merged }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          COMMIT_AUTHOR_LOGIN: ${{ github.event.head_commit.author.username }}
+          COMMIT_AUTHOR_NAME: ${{ github.event.head_commit.author.name }}
           REPO: ${{ github.repository }}
-          ACTION: ${{ github.event.action }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           # Use jq to safely JSON-encode all string fields (handles quotes,
           # newlines, control chars, etc. without manual escaping).
@@ -61,51 +63,75 @@ jobs:
           #   external_references  — a clickable chip rendered above the bubble,
           #                          with an optional embedded `content` payload
           #                          that reaches the model but stays hidden in
-          #                          the UI. Used here to attach the PR (chip
-          #                          shows title + author/repo, content carries
-          #                          the PR body).
+          #                          the UI. Used here to attach the head commit
+          #                          (chip shows subject + short SHA/author/repo,
+          #                          content carries the full message + diff).
           #
-          # title and subtitle are capped at 200 characters by internal-agent;
-          # content is capped at 50_000. Truncate defensively to avoid 422s on
-          # long PR titles or bodies.
+          # title and subtitle are capped at 200 bytes by internal-agent;
+          # content is capped at 50_000. We byte-truncate the combined
+          # message+diff to 49_000 then run iconv -c to repair any UTF-8
+          # boundary breakage caused by head -c cutting mid-codepoint.
+
+          AFTER_SHORT="${AFTER_SHA:0:7}"
+
+          # Pick a display name: prefer GitHub login (renders as @handle),
+          # fall back to the commit author's name (no @).
+          if [ -n "$COMMIT_AUTHOR_LOGIN" ]; then
+            AUTHOR_DISPLAY="@${COMMIT_AUTHOR_LOGIN}"
+          else
+            AUTHOR_DISPLAY="${COMMIT_AUTHOR_NAME}"
+          fi
+
+          COMMIT_SUBJECT=$(git log -1 --pretty=%s "$AFTER_SHA")
+          COMMIT_MESSAGE=$(git log -1 --pretty=%B "$AFTER_SHA")
+
+          # Diff for everything pushed in this event. The initial push to a
+          # branch sets `before` to forty zeros — there is no parent to diff
+          # against, so fall back to showing the head commit alone.
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            DIFF=$(git show --no-color --format= "$AFTER_SHA")
+          else
+            DIFF=$(git diff --no-color "$BEFORE_SHA" "$AFTER_SHA")
+          fi
+
+          CONTENT=$(printf '%s\n\n```diff\n%s\n```\n' "$COMMIT_MESSAGE" "$DIFF" \
+            | head -c 49000 \
+            | iconv -f UTF-8 -t UTF-8 -c)
+
           jq -n \
             --arg agent_mode "content-configuration-agent" \
-            --arg summary "A new PR has been submitted. Can you please check which docs need updating?" \
+            --arg summary "A new commit has landed on \`${BRANCH}\`. Can you please check which docs need updating?" \
             --arg prompt "There was an update to the code. Search THIS WORKSPACE's own content — the help-center articles, collections, and procedures authored by this workspace's team — for anything that may be affected, and propose concrete edits to that content straight away. IMPORTANT: do NOT search, reference, or propose edits against Intercom's own product documentation or any generic Intercom content; the goal is to keep the workspace's customer-facing and internal content in sync with the code change, not to learn or explain how Intercom itself works. Do NOT ask for confirmation, do NOT ask clarifying questions, and do NOT wait for approval before drafting changes — go ahead and produce the proposed updates in this same response. This trigger comes from a GitHub Action and there is no human in the loop to answer follow-up questions, so any hesitation or request for confirmation is a failure mode. Just identify the relevant workspace-owned content and propose the updates directly." \
-            --arg pr_title "$PR_TITLE" \
-            --arg pr_body "$PR_BODY" \
-            --arg pr_url "$PR_URL" \
-            --arg pr_number "$PR_NUMBER" \
-            --arg pr_author "$PR_AUTHOR" \
-            --arg pr_base "$PR_BASE" \
-            --arg pr_head "$PR_HEAD" \
-            --arg pr_state "$PR_STATE" \
-            --arg pr_merged "$PR_MERGED" \
+            --arg subject "$COMMIT_SUBJECT" \
+            --arg subtitle "commit ${AFTER_SHORT} · ${AUTHOR_DISPLAY} · ${REPO}" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg content "$CONTENT" \
+            --arg sha "$AFTER_SHA" \
+            --arg branch "$BRANCH" \
+            --arg author_login "$COMMIT_AUTHOR_LOGIN" \
+            --arg author_name "$COMMIT_AUTHOR_NAME" \
             --arg repo "$REPO" \
-            --arg action "$ACTION" \
             '{
               agent_mode: $agent_mode,
               summary: $summary,
               hidden_instructions: $prompt,
               external_references: [
                 {
-                  title: ($pr_title | .[0:200]),
-                  subtitle: (("PR #" + $pr_number + " · @" + $pr_author + " · " + $repo) | .[0:200]),
+                  title: ($subject | .[0:200]),
+                  subtitle: ($subtitle | .[0:200]),
                   iconKind: "github",
-                  url: $pr_url,
-                  content: ($pr_body | .[0:50000])
+                  url: $commit_url,
+                  content: $content
                 }
               ],
               metadata: {
                 trigger_source: "github_action",
-                github_event: ("pull_request." + $action),
+                github_event: "push",
                 github_repository: $repo,
-                github_pr_number: ($pr_number | tonumber),
-                github_pr_actor: $pr_author,
-                github_base_branch: $pr_base,
-                github_head_branch: $pr_head,
-                github_pr_state: $pr_state,
-                github_pr_merged: ($pr_merged == "true")
+                github_branch: $branch,
+                github_commit_sha: $sha,
+                github_commit_author_login: $author_login,
+                github_commit_author_name: $author_name
               }
             }' > payload.json
           echo "payload size: $(wc -c < payload.json) bytes"
