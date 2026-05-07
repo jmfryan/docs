@@ -47,8 +47,30 @@ jobs:
         run: |
           # Use jq to safely JSON-encode all string fields (handles quotes,
           # newlines, control chars, etc. without manual escaping).
+          #
+          # The payload combines a short visible `summary` text with two of
+          # internal-agent's structured message-part types:
+          #
+          #   summary              — short visible text rendered as the user's
+          #                          first chat bubble. Frames what the agent
+          #                          is being asked to do for anyone reading
+          #                          the conversation.
+          #   hidden_instructions  — steering text fed to the model only; never
+          #                          shown in the chat bubble. Used here to give
+          #                          the agent its task without polluting the UI.
+          #   external_references  — a clickable chip rendered above the bubble,
+          #                          with an optional embedded `content` payload
+          #                          that reaches the model but stays hidden in
+          #                          the UI. Used here to attach the PR (chip
+          #                          shows title + author/repo, content carries
+          #                          the PR body).
+          #
+          # title and subtitle are capped at 200 characters by internal-agent;
+          # content is capped at 50_000. Truncate defensively to avoid 422s on
+          # long PR titles or bodies.
           jq -n \
             --arg agent_mode "content-configuration-agent" \
+            --arg summary "A new PR has been submitted. Can you please check which docs need updating?" \
             --arg prompt "There was an update to the code. Search THIS WORKSPACE's own content — the help-center articles, collections, and procedures authored by this workspace's team — for anything that may be affected, and propose concrete edits to that content straight away. IMPORTANT: do NOT search, reference, or propose edits against Intercom's own product documentation or any generic Intercom content; the goal is to keep the workspace's customer-facing and internal content in sync with the code change, not to learn or explain how Intercom itself works. Do NOT ask for confirmation, do NOT ask clarifying questions, and do NOT wait for approval before drafting changes — go ahead and produce the proposed updates in this same response. This trigger comes from a GitHub Action and there is no human in the loop to answer follow-up questions, so any hesitation or request for confirmation is a failure mode. Just identify the relevant workspace-owned content and propose the updates directly." \
             --arg pr_title "$PR_TITLE" \
             --arg pr_body "$PR_BODY" \
@@ -63,13 +85,15 @@ jobs:
             --arg action "$ACTION" \
             '{
               agent_mode: $agent_mode,
-              summary: ($prompt + "\n\n## Pull request: " + $pr_title + "\n\n" + $pr_body),
-              source_references: [
+              summary: $summary,
+              hidden_instructions: $prompt,
+              external_references: [
                 {
-                  type: "github_pull_request",
+                  title: ($pr_title | .[0:200]),
+                  subtitle: (("PR #" + $pr_number + " · @" + $pr_author + " · " + $repo) | .[0:200]),
+                  iconKind: "github",
                   url: $pr_url,
-                  title: $pr_title,
-                  author: $pr_author
+                  content: ($pr_body | .[0:50000])
                 }
               ],
               metadata: {
